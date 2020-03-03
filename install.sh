@@ -1,4 +1,6 @@
 # requires python 3.6
+SCRIPT=$(readlink -f "$0")
+cd $SCRIPT
 mkdir clas_update
 mv . clas_update
 cd clas_update
