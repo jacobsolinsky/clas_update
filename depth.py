@@ -5,11 +5,13 @@ Created on Fri Feb 28 14:57:54 2020
 
 @author: Lab
 """
-import allen_constituency_parse
-import allen_dependency_parse
-from functools import lru_cache
 from graphviz import Digraph
 import spacy
+import re
+from manual_parse import constituency_parse, dependency_parse
+import os
+from PyPDF2 import PdfFileMerger
+import pandas as pd
 
 sentence_splitter = spacy.load('en_core_web_sm')
 
@@ -40,11 +42,15 @@ class ConstituencyTree:
                 )
         return f'<ol>{self.node_type}: {inner}</ol>'
     
-    def frazier_yngve_graph(self, dot = None, parent = None):
+    def frazier_yngve_graph(self, dot = None, parent = None, 
+                            leaf_graph = None, path = None, view=False):
         #This generates a graph of the constituency tree with frazier and yngve score details.
         final = True
         if not dot:
             dot = Digraph()
+            dot.graph_attr['rankdir'] = 'BT'
+            leaf_graph = Digraph(name='leaves')
+            leaf_graph.graph_attr['rank'] = 'min'
         else:
             final = False
         content = f'''{self.node_type}: {self.word}
@@ -56,9 +62,20 @@ class ConstituencyTree:
             dot.edge(str(self.id), str(parent))
         if not self.is_leaf:
             for child in self.children:
-                child.frazier_yngve_graph(dot, self.id)
+                child.frazier_yngve_graph(dot, self.id, leaf_graph=leaf_graph)
+        if self.is_leaf:
+            leaf_graph.node(str(self.id), content)
         if final:
-            dot.render('frazier-yngve-plot.gv', view=True)
+            dot.subgraph(leaf_graph)
+            if not path:
+                path = self.words + '_ct.gz'
+            dot.render(path, view=view)
+    
+    @property
+    def words(self):
+        if not hasattr(self, '_words'):
+            self._words = ' '.join([leaf.word for leaf in self.leaves])
+        return self._words
 
     @property
     def nodal_yngve(self):
@@ -116,6 +133,8 @@ class ConstituencyTree:
         #Stopping when an ancester with nodal score of 0 is reached
         if not hasattr(self, '_leaf_frazier'):
             self._leaf_frazier = self.nodal_frazier
+            if self._leaf_frazier == 0:
+                return self._leaf_frazier
             handle = self
             while handle.parent:
                 if handle.parent.nodal_frazier == 0: break
@@ -236,6 +255,14 @@ class ConstituencyTree:
     def mean_Fdepth(self):
         #mean frazier score of the leaves
         return self.total_Fdepth / len(self.leaves)
+    
+    @property
+    def max_Ydepth(self):
+        return max([leaf.leaf_yngve for leaf in self.leaves])
+    
+    @property
+    def max_Fdepth(self):
+        return max([leaf.leaf_frazier for leaf in self.leaves])
 
     @staticmethod
     def constituency_parse(sentence, engine='allennlp'):
@@ -247,6 +274,7 @@ class ConstituencyTree:
     
     @classmethod
     def allen_constituency_parse(cls, sentence):
+        import allen_constituency_parse
         #Generates the allennlp parse tree. This parse tree requires further
         #translation to create an instance of the ConstituencyTree class
         return ConstituencyTree.allen_constituency_process(
@@ -284,6 +312,30 @@ class DependencyTree:
                 for r in self.relations])
         return f'<ul>{inner}</ul>'
     
+    @property
+    def words(self):
+        if not hasattr(self, '_words'):
+            max_ = 0
+            for r in self.relations:
+                if r['head_pos'] > max_: max_ = r['head_pos']
+                if r['tail_pos'] > max_: max_ = r['tail_pos']
+            self._words = [''] * (max_ + 1)
+            for r in self.relations:
+                self._words[r['head_pos']] = r['head']
+                self._words[r['tail_pos']] = r['tail']
+            self._words = ' '.join(self._words)
+        return self._words
+    
+    def graph(self, path=None, view=False):
+        dot = Digraph()
+        for r in self.relations:
+            dot.node(str(r['head_pos']), r['head'])
+            dot.node(str(r['tail_pos']), r['tail'])
+            dot.edge(str(r['head_pos']), str(r['tail_pos']), label=r['relation_type'])
+        if not path:
+            path = self.words + '_dt.gv'
+        dot.render(path, view=view)
+    
     def add(self, head, head_pos, relation_type, tail, tail_pos):
         self.relations.append({
                 'head': head,
@@ -307,6 +359,12 @@ class DependencyTree:
         #mean length of the relations in this dependency tree
         return self.total_SynDepLen / len(self.relations)
     
+    @property
+    def max_SynDepLen(self):
+        if not hasattr(self, '_max_SynDepLen'):
+            self._max_SynDepLen = max([abs(r['head_pos'] - r['tail_pos']) for r in self.relations])
+        return self._max_SynDepLen
+    
     @staticmethod
     def dependency_parse(sentence, engine='allennlp'):
         #generates the dependency tree with a given engine
@@ -316,6 +374,7 @@ class DependencyTree:
     
     @classmethod
     def allen_dependency_parse(cls, sentence):
+        import allen_dependency_parse
         #generates an allennlp parsed dependency tree
         #further translation is required to create a DependencyTree instance
         return DependencyTree.allen_dependency_process(
@@ -361,10 +420,13 @@ def get_statistics(sentence, engine='allennlp'):
             'num_clauses': ct.num_clauses,
             'mean_Fdepth': ct.mean_Fdepth,
             'total_Fdepth': ct.total_Fdepth,
+            'max_Fdepth': ct.max_Fdepth,
             'mean_Ydepth': ct.mean_Ydepth,
             'total_Ydepth': ct.total_Ydepth,
+            'max_Ydepth': ct.max_Ydepth,
             'mean_SynDepLen': dt.mean_SynDepLen,
             'total_SynDepLen': dt.total_SynDepLen,
+            'max_SynDepLen': dt.max_SynDepLen,
             'noun_count': ct.noun_count,
             'adj_count': ct.adj_count,
             'adverb_count': ct.adverb_count,
@@ -374,6 +436,83 @@ def get_statistics(sentence, engine='allennlp'):
             'prep_count': ct.prep_count,
             'properN_count': ct.properN_count,
     }
+
+class Paragraph:
+    def __init__(self, engine='allennlp', **kwargs):
+        assert ('text' in kwargs or ('constituency_trees' in kwargs and 'dependency_trees' in kwargs))
+        self.dirname = kwargs['dirname']
+        if 'text' in kwargs:
+            self.text = kwargs['text']
+            self.sentences = [str(sentence) for sentence in 
+                sentence_splitter(kwargs['text']).sents]
+            self.constituency_trees = [
+                    ConstituencyTree.constituency_parse(sentence, engine) 
+                    for sentence in self.sentences]
+            self.dependency_trees = [
+                    DependencyTree.dependency_parse(sentence, engine) 
+                    for sentence in self.sentences]
+        elif 'constituency_trees' in kwargs:
+            self.constituency_trees = [
+                    constituency_parse(ct) for ct in kwargs['constituency_trees']
+                ]
+            self.dependency_trees = [
+                    dependency_parse(dt) for dt in kwargs['dependency_trees']
+                ]
+            self.sentences = [ct.words for ct in self.constituency_trees]
+    
+    @property
+    def statistics_per_sentence(self):
+        if not hasattr(self, '_statistics_per_sentence'):
+            self._statistics_per_sentence = [
+                {
+                'sentenceID': i,
+                'sentence_text': sentence,
+                'num_clauses': ct.num_clauses,
+                'mean_Fdepth': ct.mean_Fdepth,
+                'total_Fdepth': ct.total_Fdepth,
+                'max_Fdepth': ct.max_Fdepth,
+                'mean_Ydepth': ct.mean_Ydepth,
+                'total_Ydepth': ct.total_Ydepth,
+                'max_Ydepth': ct.max_Ydepth,
+                'mean_SynDepLen': dt.mean_SynDepLen,
+                'total_SynDepLen': dt.total_SynDepLen,
+                'max_SynDepLen': dt.max_SynDepLen,
+                'noun_count': ct.noun_count,
+                'adj_count': ct.adj_count,
+                'adverb_count': ct.adverb_count,
+                'verb_count': ct.verb_count,
+                'det_count': ct.det_count,
+                'conj_count': ct.conj_count,
+                'prep_count': ct.prep_count,
+                'properN_count': ct.properN_count,
+                } for i, sentence, ct, dt in zip(
+                        range(len(self.sentences)),
+                        self.sentences, self.constituency_trees, 
+                        self.dependency_trees)
+            ]
+        return self._statistics_per_sentence
+    
+    def __repr__(self):
+            return f"""sentenceID|sentence_text|num_clauses|mean_Fdepth|total_Fdepth|mean_Ydepth|total_Ydepth|mean_SynDepLen|total_SynDepLen|noun_count|adj_count|adverb_count|verb_count|det_count|conj_count|prep_count|properN_count
+        {"".join([f'''{s["sentenceID"]}|{s["sentence_text"]}|{s["num_clauses"]}|{s["mean_Fdepth"]}|{s["total_Fdepth"]}|{s["mean_Ydepth"]}|{s["total_Ydepth"]}|{s["mean_SynDepLen"]}|{s["total_SynDepLen"]}|{s["noun_count"]}|{s["adj_count"]}|{s["adverb_count"]}|{s["verb_count"]}|{s["det_count"]}|{s["conj_count"]}|{s["prep_count"]}|{s["properN_count"]}
+        '''
+        for s in self.statistics_per_sentence])}"""
+    def graph(self):
+        paths = []
+        for ct, dt, i in zip(self.constituency_trees, self.dependency_trees, range(len(self.constituency_trees))):
+            ctpath = self.dirname + '/' + str(i) + '_ct.gz'
+            dtpath = self.dirname + '/' + str(i) + '_dt.gz'
+            paths.append(ctpath + '.pdf')
+            paths.append(dtpath + '.pdf')
+            ct.frazier_yngve_graph(view=False, path=ctpath)
+            dt.graph(view=False, path=dtpath)
+        merger = PdfFileMerger()
+        for file in paths:
+            merger.append(file)
+        merger.write(self.dirname + '/' + 'sentence_diagrams.pdf')
+        for file in paths:
+            os.remove(file)
+            os.remove(file[:-4])
 
 def process_sentences(text):
     #Breaks up a text into sentences and gets statistics and returns a printable representation
@@ -386,4 +525,73 @@ def process_sentences(text):
     {"".join([f'''{s["sentenceID"]}|{s["sentence_text"]}|{s["num_clauses"]}|{s["mean_Fdepth"]}|{s["total_Fdepth"]}|{s["mean_Ydepth"]}|{s["total_Ydepth"]}|{s["mean_SynDepLen"]}|{s["total_SynDepLen"]}|{s["noun_count"]}|{s["adj_count"]}|{s["adverb_count"]}|{s["verb_count"]}|{s["det_count"]}|{s["conj_count"]}|{s["prep_count"]}|{s["properN_count"]}
     '''
     for s in dicts])}"""
-        
+
+def get_paragraph_statistics(text):
+    sentences = sentence_splitter(text).sents
+    return [{**get_statistics(str(sentence)), **{'sentenceID': i}}
+        for i, sentence in enumerate(sentences)
+    ]
+
+def parse_manual_annotated(text, dirname):
+    start_text_position = re.search(r'Here:', text).span()[1]
+    try:
+        str_position = re.search(r'Str:', text).span()[0]
+    except AttributeError:
+        str_position = len(text) - 1
+    root_positions = [r.span()[1] for r in re.finditer(r'\(ROOT', text)]
+    def find_closing_parenthesis(subtext):
+        par_count = 0
+        for i, c in enumerate(subtext):
+            if c == '(':
+                par_count += 1
+            elif c == ')': 
+                par_count -= 1
+            if par_count < 0:
+                return i
+    root_end_positions = [rp + find_closing_parenthesis(text[rp:])
+        for rp in root_positions
+    ]
+    auto_paragraph = Paragraph(text=text[start_text_position: root_positions[0] - 6], dirname=dirname + '_auto')
+    constituency_trees = [
+            text[rp:rep] for rp, rep in zip(root_positions, root_end_positions)
+            ]
+    dependency_trees = [
+            text[rep + 2: n - 6] for rep, n in zip(root_end_positions, root_positions[1:] + [str_position + 6])
+            ]
+    manual_paragraph = Paragraph(constituency_trees=constituency_trees, 
+                                             dependency_trees=dependency_trees, dirname=dirname + '_manual')
+    return auto_paragraph, manual_paragraph
+
+def process_multiple_manual(paths, dirnames):
+    stat_list = []
+    for path, dirname in zip(paths, dirnames):
+        if not os.path.exists(dirname + '_auto'):
+            os.makedirs(dirname + '_auto')
+        if not os.path.exists(dirname + '_manual'):
+            os.makedirs(dirname + '_manual')
+        with open(path) as f: text = f.read()
+        auto_paragraph, manual_paragraph = parse_manual_annotated(text, dirname)
+        auto_paragraph.graph()
+        manual_paragraph.graph()
+        auto_stats = auto_paragraph.statistics_per_sentence
+        manual_stats = manual_paragraph.statistics_per_sentence
+        for i, (a, m) in enumerate(zip(auto_stats, manual_stats)):
+            stat_list.append({
+                'index': dirname + str(i),
+                'Max Y': m['max_Ydepth'],
+                'Auto Max Y': a['max_Ydepth'],
+                'Total Y': m['total_Ydepth'],
+                'Max F': m['max_Fdepth'],
+                'Auto Max F': a['max_Fdepth'],
+                'Total F': m['total_Fdepth'],
+                'Auto Total F': a['total_Fdepth'],
+                'Total Dep': m['total_SynDepLen'],
+                'Auto Total Dep': a['total_SynDepLen'],
+                'Max Dep': m['max_SynDepLen'],
+                'Auto Max Dep': a['max_SynDepLen'],
+                    })
+    df = pd.DataFrame(stat_list)
+    df.to_csv('complexity_Jacob.csv')
+    
+#paths, dirnames = ["/Users/jacobsolinsky/Downloads/Validation_GK_S1.txt", "/Users/jacobsolinsky/Downloads/Validation_JD_S1.txt", "/Users/jacobsolinsky/Downloads/Validation_SS_S1.txt"], ['GK', 'JD', 'SS']
+            
